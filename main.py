@@ -14,19 +14,32 @@ import mido
 MidiFile = mido.MidiFile
 Message = mido.Message
 
+# https://stackoverflow.com/a/16090640/3154813
+def natural_sort_key(s, _nsre=re.compile('([0-9]+)')):
+    return [int(text) if text.isdigit() else text.lower()
+            for text in _nsre.split(s)]
+
 class Track(threading.Thread):
-    def __init__(self, outport, trackId : int):
+    """
+    plays midi files that have been queued and optionnally calls callback functions after having played each file
+    """
+    def __init__(self, outport : mido.ports.IOPort, channel : int):
+        if not 0 <= channel <= 15 :
+            errorStr = "channel number should be between 0 and 15 both included ({0} given)".format(channel)
+            raise ValueError(errorStr)
         super().__init__()
         self._msgQueue : Queue[List[Message]] = queue.Queue()
         self._outport = outport
-        self._trackId = trackId
-        self._callback = None
+        self._channel = channel
+        self._callback : Callable = None
 
     def stop(self):
         self._msgQueue.put(None)
 
     def queueMidi(self, midi: MidiFile):
         msgList = [msg for msg in midi if not msg.is_meta]
+        for msg in msgList:
+            msg.channel = self._channel
         self._msgQueue.put(msgList)
 
     def setCallback(self, callback):
@@ -45,14 +58,17 @@ class Track(threading.Thread):
                 self._callback()
 
 
-
 class PatternOrchestra(threading.Thread):
     def __init__(self, nbOfTracks : int, patternsPath : str):
+        if nbOfTracks < 1:
+            errorMsg = "nbOfTrack argument has to be at least 1 ({0} given)".format(nbOfTracks)
+            raise ValueError(errorMsg)
+
         super().__init__()
         self._outports : List[mido.ports.IOPort] = None
         self._patterns : List[MidiFile] = None
         self._tracks : List[Track] = None
-        self._tracksPatternNb : List[int] = None
+        self._curPatterns : List[int] = None
         self._callbackQueue = queue.Queue()
 
         # load patterns
@@ -67,17 +83,18 @@ class PatternOrchestra(threading.Thread):
         # open ports and init tracks
         outports = [port for port in mido.get_output_names() if "loopMIDI" in port]
         print(outports)
-        maxNbOfTracks = min(nbOfTracks, len(outports))
-        neededOutportsNb = nbOfTracks
-        if nbOfTracks > maxNbOfTracks:
+        maxNbOfTracks = min(nbOfTracks, len(outports)*16)
+        maxNbOfOutPorts = (maxNbOfTracks-1) // 16 + 1
+        neededNbOfOutports = (nbOfTracks-1) // 16 + 1
+        if nbOfTracks >= maxNbOfTracks:
             print("starting only {0} of the {1} requested tracks because only {2} output midi port(s) is/are available "
-                  "({3} needed)".format(maxNbOfTracks, nbOfTracks, len(outports), neededOutportsNb))
-        self._outports = [mido.open_output(outports[i]) for i in range(maxNbOfTracks)]
-        tracks = [Track(self._outports[trackNb], trackNb) for trackNb in range(maxNbOfTracks)]
+                  "(16 channels per port, so {3} ports needed)".format(maxNbOfTracks, nbOfTracks, len(outports), neededNbOfOutports))
+        self._outports = [mido.open_output(outports[i]) for i in range(maxNbOfOutPorts)]
+        tracks = [Track(self._outports[trackNb//16], trackNb%16) for trackNb in range(maxNbOfTracks)]
         for i,track in enumerate(tracks):
-            track.setCallback(lambda trackNb=i: self._callbackQueue.put(trackNb))
+            track.setCallback(lambda trackNb=i: self._callbackQueue.put([trackNb]))
         self._tracks = tracks
-        self._tracksPatternNb = [None] * len(self._tracks)
+        self._curPatterns = [None]*len(self._tracks)
 
     def stop(self):
         self._callbackQueue.put(None)
@@ -88,45 +105,51 @@ class PatternOrchestra(threading.Thread):
         for port in self._outports:
             port.close()
 
-    def queuePattern(self, patternNb, trackNb):
-        self._tracksPatternNb[trackNb] = patternNb
+    def queuePatternOnTrack(self, patternNb, trackNb):
+        self._curPatterns[trackNb] = patternNb
         if patternNb >= len(self._patterns):
             return
         self._tracks[trackNb].queueMidi(self._patterns[patternNb])
 
-    def queueNeighbourPattern(self, stepSize, trackNb):
-        patternNb = self._tracksPatternNb[trackNb] + stepSize
-        self.queuePattern(patternNb, trackNb)
+    def queueNeighbourPatternOnTrack(self, stepSize, trackNb):
+        patternNb = self._curPatterns[trackNb] + stepSize
+        self.queuePatternOnTrack(patternNb, trackNb)
+
+    def repeat(self, trackNb):
+        self.queueNeighbourPatternOnTrack(0, trackNb)
+
+    def next(self, trackNb):
+        self.queueNeighbourPatternOnTrack(1, trackNb)
+
+    def beforeStart(self):
+        self.queuePatternOnTrack(0,0)
+        for i in range(1, len(self._tracks)):
+            self.queuePatternOnTrack(1, i)
 
     def advanceTrack(self, trackNb : int):
-        chance = random.random()
-        step = chance < .1
-        if step:
-            print("{0}: {1} > {2}".format(trackNb, self._tracksPatternNb[trackNb], self._tracksPatternNb[trackNb]+1))
-        self.queueNeighbourPattern(step, trackNb)
+        if trackNb is 0:
+            self.repeat(trackNb)
+            return
+        stepChance = .1
+        if random.random() < stepChance:
+            print("{0}: {1} > {2}".format(trackNb, self._curPatterns[trackNb],self._curPatterns[trackNb]+1))
+            self.next(trackNb)
+        else:
+            self.repeat(trackNb)
 
     def run(self):
         random.seed()
 
-        for i,_ in enumerate(self._tracks):
-            self.queuePattern(0, i)
+        self.beforeStart()
 
         for track in self._tracks:
             track.start()
 
         while True:
-            trackToAdvance = self._callbackQueue.get()
-            if trackToAdvance is None:
+            args = self._callbackQueue.get()
+            if args is None:
                 return
-            self.advanceTrack(trackToAdvance)
-
-
-
-
-# https://stackoverflow.com/a/16090640/3154813
-def natural_sort_key(s, _nsre=re.compile('([0-9]+)')):
-    return [int(text) if text.isdigit() else text.lower()
-            for text in _nsre.split(s)]
+            self.advanceTrack(*args)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
